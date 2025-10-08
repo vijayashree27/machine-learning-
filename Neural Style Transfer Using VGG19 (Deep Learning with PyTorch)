@@ -1,0 +1,112 @@
+import torch
+import torch.optim as optim
+from torchvision import transforms, models
+from PIL import Image
+import matplotlib.pyplot as plt
+import requests
+from io import BytesIO
+
+# Detect GPU if available (runs faster)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f" Using device: {device}")
+
+# -------------------- STEP 2: Load and Preprocess Images --------------------
+# Replace URLs with your own content & style image links if you like
+content_url = "https://pytorch.org/tutorials/_static/img/neural-style/dancing.jpg"
+style_url = "https://pytorch.org/tutorials/_static/img/neural-style/picasso.jpg"
+
+def load_image(url, max_size=400, shape=None):
+    response = requests.get(url)
+    image = Image.open(BytesIO(response.content)).convert('RGB')
+
+    size = max_size if max(image.size) > max_size else max(image.size)
+    if shape:
+        size = shape
+
+    transform = transforms.Compose([
+        transforms.Resize(size),
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x.unsqueeze(0))
+    ])
+    return transform(image)
+
+content = load_image(content_url).to(device)
+style = load_image(style_url, shape=content.shape[-2:]).to(device)
+
+# -------------------- STEP 3: Load the Pretrained Model --------------------
+vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features.to(device).eval()
+
+# -------------------- STEP 4: Define Helper Functions --------------------
+def get_features(image, model, layers=None):
+    if layers is None:
+        layers = {
+            '0': 'conv1_1',
+            '5': 'conv2_1',
+            '10': 'conv3_1',
+            '19': 'conv4_1',
+            '21': 'conv4_2',  # content layer
+            '28': 'conv5_1'
+        }
+
+    features = {}
+    x = image
+    for name, layer in model._modules.items():
+        x = layer(x)
+        if name in layers:
+            features[layers[name]] = x
+    return features
+
+def gram_matrix(tensor):
+    _, d, h, w = tensor.size()
+    tensor = tensor.view(d, h * w)
+    return torch.mm(tensor, tensor.t())
+
+# -------------------- STEP 5: Extract Features --------------------
+content_features = get_features(content, vgg)
+style_features = get_features(style, vgg)
+style_grams = {layer: gram_matrix(style_features[layer]) for layer in style_features}
+
+# -------------------- STEP 6: Create Target Image --------------------
+target = content.clone().requires_grad_(True).to(device)
+
+# -------------------- STEP 7: Define Loss Weights --------------------
+style_weight = 1e6
+content_weight = 1e0
+
+# -------------------- STEP 8: Optimize the Target --------------------
+optimizer = optim.Adam([target], lr=0.003)
+epochs = 200
+
+for i in range(1, epochs + 1):
+    target_features = get_features(target, vgg)
+    content_loss = torch.mean((target_features['conv4_2'] - content_features['conv4_2']) ** 2)
+
+    style_loss = 0
+    for layer in style_grams:
+        target_feature = target_features[layer]
+        target_gram = gram_matrix(target_feature)
+        _, d, h, w = target_feature.shape
+        style_gram = style_grams[layer]
+        layer_style_loss = torch.mean((target_gram - style_gram) ** 2)
+        style_loss += layer_style_loss / (d * h * w)
+
+    total_loss = content_weight * content_loss + style_weight * style_loss
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    if i % 50 == 0:
+        print(f" Step [{i}/{epochs}] | Total loss: {total_loss.item():.4f}")
+
+# -------------------- STEP 9: Display Result --------------------
+def im_convert(tensor):
+    image = tensor.clone().detach().cpu().squeeze()
+    image = image.numpy().transpose(1, 2, 0)
+    image = image.clip(0, 1)
+    return image
+
+plt.figure(figsize=(10, 6))
+plt.imshow(im_convert(target))
+plt.title("Stylized Output")
+plt.axis("off")
+plt.show()
